@@ -91,11 +91,15 @@ def _local_vol(returns: np.ndarray, zero_mask: np.ndarray,
     """Annualised-equivalent daily vol using up to n active days before `before`."""
     pre = np.where(~zero_mask[:before, curve_idx])[0]
     if len(pre) >= 2:
-        return float(np.std(returns[pre[-n:], curve_idx]))
-    # fall back to std over available data
+        v = float(np.std(returns[pre[-n:], curve_idx]))
+        if v > 1e-8:
+            return v
+    # pre-window std is zero or insufficient — fall back to global history
     avail = np.where(~zero_mask[:, curve_idx])[0]
     if len(avail) >= 2:
-        return float(np.std(returns[avail, curve_idx]))
+        v = float(np.std(returns[avail, curve_idx]))
+        if v > 1e-8:
+            return v
     return 0.01
 
 
@@ -637,22 +641,31 @@ class DecorrelationInjection(BaseAnomaly):
         out = returns.copy()
         ds  = params["decorr_strength"]
 
-        # Days where ALL selected curves are active
+        win_mask = ~zero_mask[window.start_idx:window.end_idx, :][:, curves]
+
+        # Drop sparse curves (< 50% active in window) so all() can find rows
+        active_frac = win_mask.mean(axis=0)
+        liquid_idx  = np.where(active_frac >= 0.5)[0]
+        if len(liquid_idx) < 2:
+            return out
+        liquid_curves = [curves[i] for i in liquid_idx]
+
+        # Days where ALL liquid curves are simultaneously active
         active_rows = np.where(
-            (~zero_mask[window.start_idx:window.end_idx, :][:, curves]).all(axis=1)
+            (~zero_mask[window.start_idx:window.end_idx, :][:, liquid_curves]).all(axis=1)
         )[0] + window.start_idx
 
         if len(active_rows) < 2:
             return out
 
-        R_act  = returns[active_rows, :][:, curves]  # (T_act, n_c)
-        r_mean = R_act.mean(axis=1)                  # (T_act,)
+        R_act  = returns[active_rows, :][:, liquid_curves]  # (T_act, n_liq)
+        r_mean = R_act.mean(axis=1)                         # (T_act,)
         norm2  = float(r_mean @ r_mean)
 
         if norm2 < 1e-12:
             return out
 
-        for i, c in enumerate(curves):
+        for i, c in enumerate(liquid_curves):
             col    = R_act[:, i]
             proj   = float(col @ r_mean) / norm2
             r_orth = col - ds * proj * r_mean
@@ -1384,43 +1397,36 @@ class ScenarioBank:
         tickers   = scenario_result.get("tickers",
                         [f"c{i}" for i in range(delta.shape[1])])
 
-        self._con.execute(
-            "INSERT INTO scenarios VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [sid, engine_run_id, self.data_run_id,
-             seed, density_mode, len(anomalies), datetime.now()]
-        )
+        ann = np.sqrt(252)
 
+        # Build all rows before touching the DB so the transaction is short.
+        ai_rows = []
+        ac_rows = []
         for rec in anomalies:
-            self._con.execute(
-                "INSERT INTO anomaly_instances VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [rec.anomaly_id, sid, rec.anomaly_type, rec.layer,
-                 ANOMALY_REGISTRY[rec.anomaly_type].layer_priority,
-                 rec.window.start_idx, rec.window.end_idx,
-                 json.dumps(rec.params), json.dumps(rec.param_specs),
-                 ANOMALY_REGISTRY[rec.anomaly_type].targeting_policy["mode"]]
-            )
-            for ci in rec.affected_curves:
-                self._con.execute(
-                    "INSERT INTO anomaly_affected_curves VALUES (?, ?)",
-                    [rec.anomaly_id, int(ci)]
-                )
+            ai_rows.append([
+                rec.anomaly_id, sid, rec.anomaly_type, rec.layer,
+                ANOMALY_REGISTRY[rec.anomaly_type].layer_priority,
+                rec.window.start_idx, rec.window.end_idx,
+                json.dumps(rec.params), json.dumps(rec.param_specs),
+                ANOMALY_REGISTRY[rec.anomaly_type].targeting_policy["mode"],
+            ])
+            ac_rows.extend([rec.anomaly_id, int(ci)] for ci in rec.affected_curves)
 
-        # Sparse delta storage and snapshots
+        # Vectorised delta + snapshot assembly (avoids per-element Python loop).
         delta_rows    = []
         snapshot_rows = []
-        ann           = np.sqrt(252)
-
-        for ci in range(delta.shape[1]):
-            col_d = delta[:, ci]
-            nz    = np.where(col_d != 0)[0]
-            if len(nz) == 0:
-                continue
-
+        nz_cols       = np.where(np.any(delta != 0, axis=0))[0]
+        for ci in nz_cols:
+            col_d  = delta[:, ci]
+            nz     = np.flatnonzero(col_d)
             ticker = tickers[ci] if ci < len(tickers) else f"c{ci}"
-            for t in nz:
-                delta_rows.append(
-                    (sid, int(ci), ticker, int(t), float(col_d[t]))
-                )
+            ci_int = int(ci)
+
+            vals   = col_d[nz]
+            delta_rows.extend(
+                zip([sid] * len(nz), [ci_int] * len(nz),
+                    [ticker] * len(nz), nz.tolist(), vals.tolist())
+            )
 
             orig_r = original[nz, ci]
             pert_r = perturbed[nz, ci]
@@ -1429,25 +1435,44 @@ class ScenarioBank:
             v_rat  = p_vol / o_vol if o_vol > 1e-10 else 1.0
             o_sr   = _annualised_sharpe(orig_r)
             p_sr   = _annualised_sharpe(pert_r)
-            o_dd   = _max_drawdown(orig_r)
-            p_dd   = _max_drawdown(pert_r)
+            snapshot_rows.append((
+                sid, ci_int, ticker,
+                o_vol, p_vol, v_rat,
+                o_sr, p_sr, p_sr - o_sr,
+                float(_max_drawdown(orig_r)), float(_max_drawdown(pert_r)),
+            ))
 
-            snapshot_rows.append(
-                (sid, int(ci), ticker,
-                 o_vol, p_vol, v_rat,
-                 o_sr, p_sr, p_sr - o_sr,
-                 o_dd, p_dd)
+        # Single transaction: all inserts commit together or not at all.
+        self._con.execute("BEGIN")
+        try:
+            self._con.execute(
+                "INSERT INTO scenarios VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [sid, engine_run_id, self.data_run_id,
+                 seed, density_mode, len(anomalies), datetime.now()]
             )
-
-        if delta_rows:
-            self._con.executemany(
-                "INSERT INTO scenario_deltas VALUES (?, ?, ?, ?, ?)", delta_rows
-            )
-        if snapshot_rows:
-            self._con.executemany(
-                "INSERT INTO scenario_snapshots VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", snapshot_rows
-            )
+            if ai_rows:
+                self._con.executemany(
+                    "INSERT INTO anomaly_instances VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ai_rows
+                )
+            if ac_rows:
+                self._con.executemany(
+                    "INSERT INTO anomaly_affected_curves VALUES (?, ?)", ac_rows
+                )
+            if delta_rows:
+                self._con.executemany(
+                    "INSERT INTO scenario_deltas VALUES (?, ?, ?, ?, ?)",
+                    delta_rows
+                )
+            if snapshot_rows:
+                self._con.executemany(
+                    "INSERT INTO scenario_snapshots VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", snapshot_rows
+                )
+            self._con.execute("COMMIT")
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
 
         return sid
 
