@@ -220,3 +220,7 @@ __marimo__/
 # Editor/workspace
 .vscode/
 *.code-workspace
+
+# Local DuckDB run registry
+*.duckdb
+data/db/

@@ -3,8 +3,35 @@ scenario_engine.py
 ==================
 Blackbox stress-testing engine for weekly-rebalancing portfolio models.
 
-All 17 anomaly classes are implemented. Use `enabled_types` in ScenarioSampler
-or main() to run with a minimal subset during initial testing.
+16 anomaly classes are implemented across 4 layers. Use `enabled_types` in
+ScenarioSampler or main() to run with a minimal subset during initial testing.
+
+Realistic vs adversarial
+------------------------
+Two banks are generated. The realistic ("core") bank is meant to contain only
+perturbations with a defensible generating mechanism — things that could
+plausibly happen to a real curve. The adversarial bank additionally contains
+estimator probes: inputs no trading process produces, kept because they usefully
+attack the Layer 1 estimators.
+
+The split is enforced by ADVERSARIAL_ONLY_TYPES, which the ScenarioSampler
+filters out whenever density == "realistic". Do not add a type to the pattern
+layer without deciding which side of that line it falls on.
+
+CALIBRATION_TODO
+----------------
+Every ParamSpec range in this module is hand-set, not measured. The mechanisms
+are grounded; the numbers are not. Once real fund data lands, each range should
+be refit against the empirical distribution of the corresponding statistic on
+the real panel (per curve class — algo vs market), e.g.:
+    vol_spike.magnitude      <- realised vol-of-vol ratios
+    ar1_injection.phi        <- empirical ACF(1)
+    merton_jump.lam/sigma_j  <- tail-day frequency and size
+    *_drawdown.depth/days    <- realised max-DD depth and duration
+    *_drawdown.path_jitter   <- realised roughness of historical DD paths
+    regime_persistence.*     <- fitted 2-state switching frequency and drift
+Until then, "realistic" claims the mechanism is right, not that the parameters
+match the fund.
 
 Data convention throughout: returns arrays are (T x N)
   T = trading days (rows), N = assets (columns)
@@ -17,7 +44,7 @@ python scripts/scenario_engine.py
     [--n-scenarios-core 50]
     [--n-scenarios-adv  100]
     [--seed 42]
-    [--enabled-types vol_spike contagion vol_regime_swap bimodal_dist]
+    [--enabled-types vol_spike contagion vol_regime_swap regime_persistence]
 """
 
 from __future__ import annotations
@@ -50,9 +77,9 @@ from quant.utils.db import RunRegistry, get_connection
 from nco_engine import cov2corr, denoise_cov, ledoit_wolf_cov
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 0.  CONSTANTS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 WEEK_DAYS   = 5
 LN2         = np.log(2)
@@ -66,18 +93,20 @@ DENSITY_PRESETS = {
 LAYER_ORDER    = ["univariate", "cross_curve", "regime", "pattern"]
 RECOVERY_SHAPES = ["V", "U", "L", "W", "sqrt"]
 
-# One per layer — used as the default minimal test set
+# One per layer — used as the default minimal test set.
+# Layer IV entry must be a realistic type, or the pattern layer drops out
+# entirely when density == "realistic" (see ADVERSARIAL_ONLY_TYPES).
 MINIMAL_TEST_SET = [
-    "vol_spike",        # Layer I
-    "contagion",        # Layer II
-    "vol_regime_swap",  # Layer III
-    "bimodal_dist",     # Layer IV
+    "vol_spike",           # Layer I
+    "contagion",           # Layer II
+    "vol_regime_swap",     # Layer III
+    "regime_persistence",  # Layer IV
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 0b.  MODULE-LEVEL HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _active_days(zero_mask: np.ndarray, curve_idx: int,
                  start: int, end: int) -> np.ndarray:
@@ -86,19 +115,26 @@ def _active_days(zero_mask: np.ndarray, curve_idx: int,
     return start + rel
 
 
+# Below this, a measured std is treated as a stale/frozen-price artifact
+# rather than a real (if quiet) market — three orders of magnitude below the
+# 0.01 fallback below is not "low vol", it's a flat line with rounding noise.
+_MIN_SANE_DAILY_VOL = 1e-4
+
+
 def _local_vol(returns: np.ndarray, zero_mask: np.ndarray,
                curve_idx: int, before: int, n: int = 20) -> float:
     """Annualised-equivalent daily vol using up to n active days before `before`."""
     pre = np.where(~zero_mask[:before, curve_idx])[0]
     if len(pre) >= 2:
         v = float(np.std(returns[pre[-n:], curve_idx]))
-        if v > 1e-8:
+        if v > _MIN_SANE_DAILY_VOL:
             return v
-    # pre-window std is zero or insufficient — fall back to global history
+    # pre-window std is zero, near-flat, or insufficient — fall back to
+    # global history
     avail = np.where(~zero_mask[:, curve_idx])[0]
     if len(avail) >= 2:
         v = float(np.std(returns[avail, curve_idx]))
-        if v > 1e-8:
+        if v > _MIN_SANE_DAILY_VOL:
             return v
     return 0.01
 
@@ -147,9 +183,9 @@ def _serialise_param_specs(param_specs: dict) -> dict:
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 1.  PARAMETER SPEC & SAMPLER
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ParamSpec:
@@ -180,9 +216,9 @@ class ParameterSampler:
         return {k: v.sample(rng) for k, v in param_specs.items()}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 2.  BASE ANOMALY CLASS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class InjectionWindow:
@@ -250,57 +286,88 @@ class BaseAnomaly(ABC):
         return InjectionWindow(start_idx=s, end_idx=s + required_len)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 3.  SHARED PATH UTILITY
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_path_segment(shape: str, depth: float,
-                       n_days: int, rng: np.random.Generator) -> np.ndarray:
+                       n_days: int, rng: np.random.Generator,
+                       jitter: float = 0.0) -> np.ndarray:
     """
     Returns (n_days,) daily log-return magnitudes for one path leg.
     V / U / sqrt / L: all non-negative (caller applies sign via += or -=).
     W: signed (net = +depth over n_days, models a dip-then-recovery leg).
+
+    `jitter` (>= 0) applies multiplicative day-to-day roughness to the leg so
+    the injected path is not a ruler-straight ramp. Real drawdowns and
+    recoveries are jagged: they retrace, stall, and overshoot. The noise is
+    renormalised so the leg still sums exactly to its target, i.e. `depth`
+    remains the semantic parameter it always was.
+
+    Multiplicative (not additive) noise is deliberate: it leaves structural
+    zeros structurally zero (the L shape's flat leg, the U shape's floor),
+    where the day-to-day variation is meant to come from the underlying real
+    return the caller adds this path on top of — not from the injected shape.
     """
     if n_days <= 0:
         return np.zeros(0)
     d = float(depth)
 
     if shape == "V":
-        return np.full(n_days, d / n_days)
+        out = np.full(n_days, d / n_days)
 
-    if shape == "U":
+    elif shape == "U":
         floor_days = max(1, n_days // 4)
         move_days  = n_days - floor_days
         out = np.zeros(n_days)
         if move_days > 0:
             out[:move_days] = d / move_days
-        return out
 
-    if shape == "L":
-        return np.zeros(n_days)
+    elif shape == "L":
+        out = np.zeros(n_days)
 
-    if shape == "W":
-        # Recovery W: up 0.5d → dip 0.25d → recover 0.75d; net = d
+    elif shape == "W":
+        # Recovery W: up 0.5d — dip 0.25d — recover 0.75d; net = d
         leg = max(1, n_days // 4)
         out = np.zeros(n_days)
         out[0:leg]       =  (0.5  * d) / leg   # rise
         out[leg:2*leg]   = -(0.25 * d) / leg   # dip
         out[2*leg:3*leg] =  (0.75 * d) / leg   # recover to full
         # 4th leg: flat
-        return out
 
-    if shape == "sqrt":
+    elif shape == "sqrt":
         k = np.arange(n_days, dtype=float)
         cum = d * np.sqrt((k + 1) / n_days)
         out = np.diff(cum, prepend=0.0)
-        return out
 
-    raise ValueError(f"Unknown shape: {shape!r}")
+    else:
+        raise ValueError(f"Unknown shape: {shape!r}")
+
+    return _roughen_path(out, jitter, rng)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def _roughen_path(path: np.ndarray, jitter: float,
+                  rng: np.random.Generator) -> np.ndarray:
+    """
+    Apply multiplicative day-to-day roughness to a path leg, renormalised so
+    the leg total is unchanged. A zero-sum leg (e.g. the flat 'L' shape) is
+    returned untouched: there is no total to preserve and no shape to roughen.
+    """
+    if jitter <= 0 or path.size < 2:
+        return path
+    target = float(path.sum())
+    if abs(target) < 1e-12:
+        return path
+    rough = path * rng.normal(1.0, jitter, path.size)
+    s = float(rough.sum())
+    if abs(s) < 1e-12:
+        return path
+    return rough * (target / s)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4.  LAYER I — UNIVARIATE PERTURBATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class VolSpike(BaseAnomaly):
     layer          = "univariate"
@@ -408,6 +475,9 @@ class ArtificialDrawdown(BaseAnomaly):
         "shape":          ParamSpec(dist="choice",  choices=["V", "U", "L", "W", "sqrt"]),
         "drawdown_days":  ParamSpec(dist="uniform", low=WEEK_DAYS,   high=8*WEEK_DAYS),
         "recovery_days":  ParamSpec(dist="uniform", low=WEEK_DAYS,   high=24*WEEK_DAYS),
+        # Roughness of the injected leg. NOT calibrated — placeholder range
+        # pending real fund data; see CALIBRATION_TODO.
+        "path_jitter":    ParamSpec(dist="uniform", low=0.20,        high=0.50),
     }
     targeting_policy = {"mode": "random_subset", "n_curves_range": (1, 10)}
 
@@ -422,6 +492,7 @@ class ArtificialDrawdown(BaseAnomaly):
         shape    = params["shape"]
         dd_days  = int(params["drawdown_days"])
         rec_days = int(params["recovery_days"])
+        jitter   = float(params.get("path_jitter", 0.0))
 
         for c in curves:
             active = _active_days(zero_mask, c, window.start_idx, window.end_idx)
@@ -430,7 +501,7 @@ class ArtificialDrawdown(BaseAnomaly):
 
             # Drawdown leg
             dd_n    = min(dd_days, len(active))
-            dd_path = build_path_segment("V", depth, dd_n, rng)
+            dd_path = build_path_segment("V", depth, dd_n, rng, jitter=jitter)
             for k in range(dd_n):
                 out[active[k], c] -= dd_path[k]
 
@@ -438,7 +509,8 @@ class ArtificialDrawdown(BaseAnomaly):
             if shape != "L" and len(active) > dd_n:
                 rec_active = active[dd_n:]
                 rec_n      = min(rec_days, len(rec_active))
-                rec_path   = build_path_segment(shape, depth, rec_n, rng)
+                rec_path   = build_path_segment(shape, depth, rec_n, rng,
+                                                jitter=jitter)
                 for k in range(rec_n):
                     out[rec_active[k], c] += rec_path[k]
         return out
@@ -623,9 +695,9 @@ class MertonJumpInjection(BaseAnomaly):
         return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 5.  LAYER II — CROSS-CURVE PERTURBATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DecorrelationInjection(BaseAnomaly):
     layer          = "cross_curve"
@@ -774,9 +846,9 @@ class SynchronisedDrawdownWithRecovery(BaseAnomaly):
         return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 6.  LAYER III — REGIME PERTURBATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class VolRegimeSwap(BaseAnomaly):
     layer          = "regime"
@@ -871,6 +943,8 @@ class DrawdownRecoveryVariants(BaseAnomaly):
                                                     ["V", "U", "L"],
                                                     ["W", "sqrt", "V"]]),
         "recovery_days":        ParamSpec(dist="uniform", low=2*WEEK_DAYS, high=8*WEEK_DAYS),
+        # Not calibrated — placeholder range pending real fund data.
+        "path_jitter":          ParamSpec(dist="uniform", low=0.20, high=0.50),
     }
     targeting_policy = {"mode": "random_subset", "n_curves_range": (10, 80)}
 
@@ -883,14 +957,21 @@ class DrawdownRecoveryVariants(BaseAnomaly):
         dd_days    = int(params["drawdown_days"])
         shape_pool = params["recovery_shape_pool"]
         rec_days   = int(params["recovery_days"])
+        jitter     = float(params.get("path_jitter", 0.0))
 
-        dd_path = build_path_segment("V", depth, dd_days, rng)
+        # The *shape* of a regime-level drawdown is common across curves — that
+        # is what makes it a regime event. The roughness around it is not:
+        # sharing one jittered path would make the day-to-day noise perfectly
+        # correlated across every affected curve. So build the common leg once,
+        # then roughen it independently per curve.
+        dd_base = build_path_segment("V", depth, dd_days, rng)
 
         for c in curves:
             active = _active_days(zero_mask, c, window.start_idx, window.end_idx)
             if len(active) == 0:
                 continue
 
+            dd_path = _roughen_path(dd_base, jitter, rng)
             for k in range(min(dd_days, len(active))):
                 out[active[k], c] -= dd_path[k] if k < len(dd_path) else 0.0
 
@@ -898,44 +979,99 @@ class DrawdownRecoveryVariants(BaseAnomaly):
             if shape_c != "L" and len(active) > dd_days:
                 rec_a    = active[dd_days: dd_days + rec_days]
                 if len(rec_a) > 0:
-                    rec_path = build_path_segment(shape_c, depth, len(rec_a), rng)
+                    rec_path = build_path_segment(shape_c, depth, len(rec_a),
+                                                  rng, jitter=jitter)
                     for k, t in enumerate(rec_a):
                         out[t, c] += rec_path[k]
         return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 7.  LAYER IV — PATTERN PERTURBATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
-class BimodalDistributionWindow(BaseAnomaly):
+class RegimePersistence(BaseAnomaly):
+    """
+    REALISTIC. A two-state (risk-on / risk-off) drift regime that persists and
+    switches with low probability per day.
+
+    This is the realistic half of the old `oscillating_pattern`. Two things
+    differ from that class's "markov" mode, both deliberate:
+
+    1. ADDITIVE, not wholesale replacement. The regime adds a drift term on top
+       of the curve's real return; the original day-to-day texture (vol, tails,
+       whatever the curve actually does) survives. The old mode overwrote the
+       return entirely with `N(±A, noise*A)`, discarding the real series.
+
+    2. PERSISTENT, not anti-persistent. `p_flip` is low, so mean regime
+       duration is 1/p_flip ≈ 7-50 days. The old mode drew p_flip from
+       [0.55, 0.90] — i.e. it flipped MORE often than not, giving a mean regime
+       duration of 1.1-1.8 days and ACF(1) down to -0.81. That is an
+       oscillator, not a regime model, regardless of the "markov" label; it now
+       lives in OscillatingPattern with its siblings.
+
+    `drift_amp` is expressed in units of the curve's own local vol, so a regime
+    moves the mean by a fraction of a daily sigma — the drift accumulates into
+    a visible trend over the regime's life without producing an implausible
+    per-day Sharpe.
+    """
     layer          = "pattern"
-    name           = "bimodal_dist"
+    name           = "regime_persistence"
     layer_priority = 0
     default_param_specs = {
-        "mode_separation": ParamSpec(dist="uniform", low=1.5,  high=4.0),
-        "mode_balance":    ParamSpec(dist="uniform", low=0.3,  high=0.7),
-        "window_length":   ParamSpec(dist="uniform", low=2*WEEK_DAYS, high=10*WEEK_DAYS),
+        # Regime drift as a fraction of the curve's local daily vol.
+        # NOT calibrated — placeholder pending real fund data.
+        "drift_amp":     ParamSpec(dist="uniform", low=0.05, high=0.30),
+        # Per-day switch probability; mean regime duration = 1/p_flip.
+        # 0.02 -> ~50 trading days, 0.15 -> ~7 trading days.
+        "p_flip":        ParamSpec(dist="uniform", low=0.02, high=0.15),
+        "window_length": ParamSpec(dist="uniform", low=4*WEEK_DAYS, high=16*WEEK_DAYS),
     }
     targeting_policy = {"mode": "random_subset", "n_curves_range": (1, 5)}
 
     def apply(self, returns, zero_mask, curves, window, params, rng):
-        out     = returns.copy()
-        sep     = params["mode_separation"]
-        balance = params["mode_balance"]
+        out       = returns.copy()
+        drift_amp = params["drift_amp"]
+        p_flip    = params["p_flip"]
 
         for c in curves:
             active = _active_days(zero_mask, c, window.start_idx, window.end_idx)
             if len(active) == 0:
                 continue
-            lv = _local_vol(returns, zero_mask, c, window.start_idx)
+            lv    = _local_vol(returns, zero_mask, c, window.start_idx)
+            mu    = drift_amp * lv
+            state = int(rng.choice([-1, 1]))
             for t in active:
-                sign       = 1 if rng.uniform() < balance else -1
-                out[t, c]  = rng.normal(sign * sep * lv, 0.3 * lv)
+                out[t, c] += state * mu
+                if rng.uniform() < p_flip:
+                    state = -state
         return out
 
 
 class OscillatingPattern(BaseAnomaly):
+    """
+    ADVERSARIAL ONLY. Deterministic / stochastic sign oscillation at a fixed or
+    near-fixed frequency.
+
+    No trading process generates this: it is a signal-processing probe, kept to
+    test whether the Layer 1 estimators can be fooled by a strongly
+    anti-persistent input. It is excluded from the realistic bank by
+    ADVERSARIAL_ONLY_TYPES.
+
+    The three modes are one family — all oscillators, differing only in how the
+    sign flips:
+      deterministic : flips every day (period-2 square wave)
+      markov        : flips with probability p_flip, drawn HIGH (>0.5) so the
+                      series is anti-persistent — the stochastic counterpart of
+                      the square wave, not a regime model
+      sinusoidal    : smooth sine at a fixed period
+
+    Note on p_flip's range: since this class is now explicitly the oscillator
+    family, p_flip runs to 1.0, where markov mode converges exactly on
+    deterministic mode. The low-p_flip (persistent) half of the old range moved
+    to RegimePersistence, so there is no longer a gap between the two classes —
+    together they cover p_flip in (0, 1].
+    """
     layer          = "pattern"
     name           = "oscillating_pattern"
     layer_priority = 0
@@ -943,9 +1079,10 @@ class OscillatingPattern(BaseAnomaly):
         "amplitude":     ParamSpec(dist="uniform", low=1.0,  high=3.0),
         "noise_level":   ParamSpec(dist="uniform", low=0.0,  high=0.5),
         "window_length": ParamSpec(dist="uniform", low=2*WEEK_DAYS, high=8*WEEK_DAYS),
-        "oscillation_type": ParamSpec(dist="choice",  choices=["deterministic", "markov", "sinusoidal"]),
-        "p_flip":        ParamSpec(dist="uniform", low=0.55, high=0.90),
-        "period":           ParamSpec(dist="uniform", low=4.0,  high=20.0),
+        "oscillation_type": ParamSpec(dist="choice",
+                                      choices=["deterministic", "markov", "sinusoidal"]),
+        "p_flip":        ParamSpec(dist="uniform", low=0.55, high=1.0),
+        "period":        ParamSpec(dist="uniform", low=4.0,  high=20.0),
     }
     targeting_policy = {"mode": "random_subset", "n_curves_range": (1, 5)}
 
@@ -978,13 +1115,13 @@ class OscillatingPattern(BaseAnomaly):
                 for k, t in enumerate(active):
                     sign      = np.sin(2 * np.pi * k / period)
                     out[t, c] = rng.normal(sign * A, noise_lvl * A + 1e-10)
-                
+
         return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 9.  ANOMALY REGISTRY
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 ANOMALY_REGISTRY: dict[str, type] = {
     # Layer I
@@ -1005,14 +1142,21 @@ ANOMALY_REGISTRY: dict[str, type] = {
     "vol_regime_swap":        VolRegimeSwap,
     "drawdown_recovery_var":  DrawdownRecoveryVariants,
     # Layer IV
-    "bimodal_dist":           BimodalDistributionWindow,
+    "regime_persistence":     RegimePersistence,
     "oscillating_pattern":    OscillatingPattern,
 }
 
+# Types that are structurally implausible as real market/EA behaviour. They are
+# kept as estimator probes but must never enter the realistic core bank; the
+# ScenarioSampler filters them out whenever density == "realistic".
+ADVERSARIAL_ONLY_TYPES: set[str] = {
+    "oscillating_pattern",  # fixed-frequency / anti-persistent sign oscillation
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8.  CORRELATION DISCOVERY
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CorrelationDiscovery:
     def __init__(self, returns_wide: pd.DataFrame,
@@ -1096,9 +1240,9 @@ class CorrelationDiscovery:
         return {d: self.compute_full_sample(at_date=d) for d in dates}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 10.  SCENARIO COMPOSER + select_curves
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 def select_curves(policy: dict, corr_info: dict, N: int,
                   rng: np.random.Generator, params: dict = None) -> list:
@@ -1226,9 +1370,9 @@ class ScenarioComposer:
         }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 11.  SCENARIO SAMPLER
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ScenarioSampler:
     LAYER_WEIGHTS = {
@@ -1243,7 +1387,7 @@ class ScenarioSampler:
                         "heavy_tail_sub", "ar1_injection", "merton_jump"],
         "cross_curve": ["decorrelation", "contagion", "sync_drawdown_recovery"],
         "regime":      ["vol_regime_swap", "drawdown_recovery_var"],
-        "pattern":     ["bimodal_dist", "oscillating_pattern"],
+        "pattern":     ["regime_persistence", "oscillating_pattern"],
     }
 
     def __init__(self, density: str = "realistic", seed: int = 42,
@@ -1253,15 +1397,24 @@ class ScenarioSampler:
         self.weights = self.LAYER_WEIGHTS[density]
         self.rng     = np.random.default_rng(seed)
 
+        # Realistic bank: drop the estimator-probe types entirely. This is the
+        # gate that makes "realistic" a property of the bank rather than a
+        # label on it — previously every pattern type was drawn at the same
+        # 10% layer weight in both banks.
+        layer_types = {
+            layer: [t for t in types
+                    if density == "adversarial" or t not in ADVERSARIAL_ONLY_TYPES]
+            for layer, types in self.LAYER_TYPES.items()
+        }
+
         if enabled_types is not None:
             enabled = set(enabled_types)
-            self._layer_types = {
+            layer_types = {
                 layer: [t for t in types if t in enabled]
-                for layer, types in self.LAYER_TYPES.items()
+                for layer, types in layer_types.items()
             }
-            self._layer_types = {k: v for k, v in self._layer_types.items() if v}
-        else:
-            self._layer_types = self.LAYER_TYPES
+
+        self._layer_types = {k: v for k, v in layer_types.items() if v}
 
     def sample_scenario_spec(self, n_anomalies: int = None) -> list:
         n = n_anomalies if n_anomalies is not None \
@@ -1307,9 +1460,9 @@ class ScenarioSampler:
         return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 12.  SCENARIO BANK
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ScenarioBank:
     def __init__(self, registry: RunRegistry, data_run_id: str):
@@ -1394,6 +1547,7 @@ class ScenarioBank:
         delta     = scenario_result["delta"]
         original  = scenario_result["original"]
         perturbed = scenario_result["perturbed"]
+        zero_mask = scenario_result["zero_mask"]
         tickers   = scenario_result.get("tickers",
                         [f"c{i}" for i in range(delta.shape[1])])
 
@@ -1430,9 +1584,13 @@ class ScenarioBank:
 
             orig_r = original[nz, ci]
             pert_r = perturbed[nz, ci]
-            o_vol  = float(np.std(orig_r) * ann) if len(orig_r) > 1 else 0.0
+            # A handful of perturbed days (vol_spike/merton_jump can touch as
+            # few as 1-3) makes np.std(orig_r) a noisy, occasionally
+            # near-zero baseline — the same pathology _local_vol already
+            # guards against. Reuse it here instead of the raw few-point std.
+            o_vol  = _local_vol(original, zero_mask, ci, int(nz[0])) * ann
             p_vol  = float(np.std(pert_r) * ann) if len(pert_r) > 1 else 0.0
-            v_rat  = p_vol / o_vol if o_vol > 1e-10 else 1.0
+            v_rat  = p_vol / o_vol if o_vol > 1e-6 else 1.0
             o_sr   = _annualised_sharpe(orig_r)
             p_sr   = _annualised_sharpe(pert_r)
             snapshot_rows.append((
@@ -1483,8 +1641,13 @@ class ScenarioBank:
         ).df()
 
     def list_scenarios(self, filters: dict = None) -> pd.DataFrame:
+        # scenarios/anomaly_instances accumulate across every past run
+        # (CREATE TABLE IF NOT EXISTS never clears old rows), so
+        # engine_run_id is included here for callers who need to scope to
+        # one run rather than the table's entire history.
         df = self._con.execute("""
-            SELECT s.scenario_id, s.density_mode, s.n_anomalies, s.created_at,
+            SELECT s.scenario_id, s.engine_run_id, s.density_mode,
+                   s.n_anomalies, s.created_at,
                    ai.anomaly_type, ai.layer, ai.window_start, ai.window_end
             FROM   scenarios s
             LEFT JOIN anomaly_instances ai ON s.scenario_id = ai.scenario_id
@@ -1496,9 +1659,9 @@ class ScenarioBank:
         return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 14.  STRESS TEST RUNNER
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 class StressTestRunner:
     DEFAULT_METRICS = ["sharpe", "max_dd", "turnover", "calmar", "tracking_error"]
@@ -1579,9 +1742,9 @@ class StressTestRunner:
             )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # 15.  MAIN ENTRYPOINT
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main(
     data_run_id:       str   = None,
@@ -1662,12 +1825,12 @@ def main(
         enabled_types  = json.dumps(enabled_types or []),
     )
 
-    # ── Build composer ────────────────────────────────────────────────────────
+    # ── Build composer ──────────────────────────────────────────────────────
     corr_disc = CorrelationDiscovery(returns_all, rolling_window, seed)
     composer  = ScenarioComposer(returns_all, zero_mask, corr_disc, seed)
     bank      = ScenarioBank(registry, data_run_id)
 
-    # ── Core bank ─────────────────────────────────────────────────────────────
+    # ── Core bank ────────────────────────────────────────────────────────────
     print(f"\n  Generating {n_scenarios_core} core (realistic) scenarios...",
           flush=True)
     sampler_core = ScenarioSampler(density="realistic", seed=seed,
@@ -1680,7 +1843,7 @@ def main(
                                    enabled_types=enabled_types)
     adv = sampler_adv.generate_bank(n_scenarios_adv, composer)
 
-    # ── Store ─────────────────────────────────────────────────────────────────
+    # ── Store ────────────────────────────────────────────────────────────────
     print("\n  Storing scenarios...", flush=True)
     for result in core:
         bank.store_scenario(result, engine_run_id,
@@ -1689,13 +1852,13 @@ def main(
         bank.store_scenario(result, engine_run_id,
                             result.get("_seed", 0), "adversarial")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # ── Summary ──────────────────────────────────────────────────────────────
     registry.log_metrics(engine_run_id,
                          n_core=n_scenarios_core,
                          n_adversarial=n_scenarios_adv)
     registry.end_run(engine_run_id)
 
-    df_summary = bank.list_scenarios()
+    df_summary = bank.list_scenarios(filters={"engine_run_id": engine_run_id})
     if df_summary is not None and not df_summary.empty:
         print("\n  Scenarios by anomaly type:")
         print(df_summary.groupby(["layer", "anomaly_type"])
@@ -1707,9 +1870,9 @@ def main(
     return bank, composer, engine_run_id
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
