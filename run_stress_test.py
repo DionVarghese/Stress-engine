@@ -3,10 +3,9 @@ run_stress_test.py
 ==================
 Phase 1 (default): Diagnostic plots — one subplot per anomaly type.
 
-  Univariate / Regime  : equity curve  (original vs perturbed)
-  Cross-curve          : rolling 20-day pairwise correlation
-                         between the 2 most affected assets
-  Pattern              : daily return bar chart inside the injection window
+  Univariate / Regime / Pattern : equity curve  (original vs perturbed)
+  Cross-curve                   : rolling 20-day pairwise correlation
+                                  between the 2 most affected assets
 
 Phase 2 (--run-model): Run model_fn wrappers against the full scenario bank.
 
@@ -59,12 +58,16 @@ LAYER_COLOURS = {
     "pattern":     "#4CAF50",
 }
 
-# Which plot type to use per layer
+# Which plot type to use per layer.
+# Pattern uses equity (cumulative), not daily-return bars: a smooth
+# sinusoidal/persistent-drift mean is visually indistinguishable from noisy
+# alternating bars in a daily-return view, but shows up clearly as a wave or
+# trend once cumulated.
 LAYER_PLOT_TYPE = {
     "univariate":  "equity",
     "regime":      "equity",
     "cross_curve": "correlation",
-    "pattern":     "daily_returns",
+    "pattern":     "equity",
 }
 
 
@@ -382,9 +385,8 @@ def plot_anomaly_diagnostics(con, returns: pd.DataFrame, out_path: str,
     """
     Grid — one subplot per anomaly type.
 
-    Univariate / Regime  → equity curve
-    Cross-curve          → rolling 20-day pairwise correlation
-    Pattern              → daily return bar chart
+    Univariate / Regime / Pattern → equity curve
+    Cross-curve                  → rolling 20-day pairwise correlation
     """
     returns_np = returns.to_numpy().astype(np.float64)
     ticker_idx = {t: i for i, t in enumerate(returns.columns)}
