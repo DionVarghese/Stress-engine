@@ -74,7 +74,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from quant.utils.db import RunRegistry, get_connection
-from nco_engine import cov2corr, denoise_cov, ledoit_wolf_cov
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +107,57 @@ MINIMAL_TEST_SET = [
 # ─────────────────────────────────────────────────────────────────────────────
 # 0b.  MODULE-LEVEL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+def cov2corr(cov: np.ndarray) -> np.ndarray:
+    """Covariance → correlation matrix."""
+    std  = np.sqrt(np.diag(cov))
+    # Guard against zero-variance columns (degenerate assets)
+    std  = np.where(std < 1e-12, 1e-12, std)
+    corr = cov / np.outer(std, std)
+    corr = np.clip(corr, -1.0, 1.0)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+    
+def corr2cov(corr: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Correlation matrix + std vector → covariance matrix."""
+    return corr * np.outer(std, std)
+
+
+def denoise_cov(cov: np.ndarray, q: float) -> np.ndarray:
+    """
+    De-noise a covariance matrix by clipping noise eigenvalues.
+
+    Eigenvalues below the MP upper bound are replaced by their mean
+    (preserving trace), leaving signal eigenvalues untouched.
+
+    q = T/n ratio for this block.
+    """
+    corr          = cov2corr(cov)
+    std           = np.sqrt(np.diag(cov))
+    e_vals, e_vecs = np.linalg.eigh(corr)
+
+    # eigh returns ascending order — reverse to descending
+    e_vals  = e_vals[::-1]
+    e_vecs  = e_vecs[:, ::-1]
+
+    # σ²=1 exactly for a correlation matrix, so the theoretical
+    # MP bound is used directly — no KDE fitting needed.
+    e_max = (1.0 + q**-0.5) ** 2
+
+    # Number of signal factors: eigenvalues strictly above e_max
+    n_signal = int(np.sum(e_vals > e_max))
+    n_signal = max(n_signal, 1)   # keep at least 1 signal factor
+
+    # Clip: replace noise eigenvalues with their mean
+    e_clip            = e_vals.copy()
+    noise_mean        = e_clip[n_signal:].mean()
+    e_clip[n_signal:] = noise_mean
+
+    # Reconstruct correlation matrix
+    corr_dn = e_vecs @ np.diag(e_clip) @ e_vecs.T
+    corr_dn = cov2corr(corr_dn)   # re-normalise numerical drift
+
+    return corr2cov(corr_dn, std), n_signal
 
 def _active_days(zero_mask: np.ndarray, curve_idx: int,
                  start: int, end: int) -> np.ndarray:
