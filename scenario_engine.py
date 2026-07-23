@@ -70,6 +70,12 @@ from sklearn.metrics import silhouette_score
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -1206,6 +1212,429 @@ ADVERSARIAL_ONLY_TYPES: set[str] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 9b.  EMPIRICAL CALIBRATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Fits the numeric bounds of a curated, defensible subset of ParamSpecs against
+# the empirical distribution of the corresponding statistic on the real panel,
+# pooled by timeframe bucket (tf). Everything not listed in PARAM_ESTIMATORS
+# keeps its hand-set class default and is reported in the `uncalibrated`
+# manifest — the tiering is explicit, not implied.
+#
+# Granularity: the statistic is measured PER CURVE; the ParamSpec is set PER
+# (anomaly_type × param × tf-bucket × density) from a percentile band of the
+# pooled per-curve values. Never per curve — that would overfit and has nowhere
+# to live in the random-subset injection flow.
+#
+# Provenance: the fit is persisted to the `scenario_calibration` table stamped
+# with the data_run_id it was fit against, and reloaded on subsequent bank
+# builds. "Is this bank calibrated?" is answerable by inspecting that table.
+
+CALIB_MIN_CURVES_PER_BUCKET = 20   # below this, fall back to the pooled-all band
+CALIB_MIN_OBS_PER_CURVE     = 50   # a curve needs this many active days to fit
+
+# Percentile bands: realistic keeps the body, adversarial reaches the tails.
+CALIB_PCT = {
+    "realistic":   (10.0, 90.0),
+    "adversarial": (1.0,  99.0),
+}
+
+
+def _active_returns(returns: np.ndarray, zero_mask: np.ndarray,
+                    c: int) -> np.ndarray:
+    """1-D active-day returns for one curve (drops inactive/zero days)."""
+    idx = np.where(~zero_mask[:, c])[0]
+    return returns[idx, c]
+
+
+# ── per-curve estimators (each returns a scalar, a tuple, or a list) ──────────
+
+def _est_acf1(r: np.ndarray) -> float:
+    x = r - r.mean()
+    denom = float(x @ x)
+    if denom < 1e-18:
+        return np.nan
+    return float((x[:-1] @ x[1:]) / denom)
+
+
+def _est_extreme_vol_units(r: np.ndarray) -> float:
+    """Tail-day size in units of the curve's own daily vol (vol_spike.magnitude,
+    regime_persistence.drift_amp live in these units)."""
+    sd = r.std()
+    if sd < _MIN_SANE_DAILY_VOL:
+        return np.nan
+    return float(np.percentile(np.abs(r) / sd, 99))
+
+
+def _est_tail_df(r: np.ndarray) -> float:
+    """Student-t dof on the vol-standardised series (tail heaviness, vol-free)."""
+    sd = r.std()
+    if sd < _MIN_SANE_DAILY_VOL:
+        return np.nan
+    try:
+        df, _, _ = stats.t.fit(r / sd, floc=0.0)
+    except Exception:
+        return np.nan
+    return float(np.clip(df, 2.5, 30.0))
+
+
+def _est_vol_ratio(r: np.ndarray, win: int = 20,
+                   hi_q: float = 0.90, base_q: float = 0.50) -> float:
+    """High-vol-window std / typical-window std (burst/persistent multipliers)."""
+    if r.size < 3 * win:
+        return np.nan
+    roll = pd.Series(r).rolling(win).std().dropna().to_numpy()
+    if roll.size < 5:
+        return np.nan
+    base = float(np.quantile(roll, base_q))
+    if base < _MIN_SANE_DAILY_VOL:
+        return np.nan
+    return float(np.quantile(roll, hi_q) / base)
+
+
+def _est_drawdowns(r: np.ndarray) -> list:
+    """Peak-to-trough episodes on arithmetic fixed-notional equity.
+    Returns [(depth_frac, duration_days), ...]. NOT cumprod — that would
+    reintroduce the compounding the pipeline is built to avoid."""
+    eq   = 1.0 + np.cumsum(r)
+    peak = np.maximum.accumulate(eq)
+    dd   = (peak - eq) / np.where(peak > 1e-12, peak, 1e-12)
+    episodes, in_dd, start, trough = [], False, 0, 0.0
+    for t in range(dd.size):
+        if not in_dd and dd[t] > 1e-9:
+            in_dd, start, trough = True, t, dd[t]
+        elif in_dd:
+            trough = max(trough, dd[t])
+            if dd[t] <= 1e-9:
+                episodes.append((trough, t - start))
+                in_dd = False
+    if in_dd:
+        episodes.append((trough, dd.size - start))
+    return [e for e in episodes if e[0] > 0.005]   # ignore trivial dips
+
+
+def _est_jumps(r: np.ndarray, k: float = 4.0) -> Optional[tuple]:
+    """Threshold jumps at k robust-sigma. Returns (lam, mu, sigma_j, mu_down,
+    mu_up) in raw arithmetic-return units, matching MertonJumpInjection."""
+    sigma = 1.4826 * np.median(np.abs(r - np.median(r)))
+    if sigma < _MIN_SANE_DAILY_VOL:
+        return None
+    z     = (r - np.median(r)) / sigma
+    jmask = np.abs(z) > k
+    lam   = float(jmask.mean())
+    js    = r[jmask]
+    if js.size == 0:
+        return (lam, np.nan, np.nan, np.nan, np.nan)
+    down, up = js[js < 0], js[js > 0]
+    return (
+        lam,
+        float(js.mean()),
+        float(js.std()) if js.size > 1 else float(abs(js[0])),
+        float(down.mean()) if down.size else np.nan,
+        float(up.mean())   if up.size   else np.nan,
+    )
+
+
+def _est_drift_per_day(r: np.ndarray) -> float:
+    """Mean daily arithmetic return (drift_injection.drift_per_day, a normal spec
+    whose loc/scale we set from the cross-curve mean/std of this)."""
+    return float(r.mean())
+
+
+# ── estimator wiring ──────────────────────────────────────────────────────────
+# mode:
+#   "band"   -> low/high = (pct_lo, pct_hi) of the pooled per-curve values
+#   "normal" -> low/high = (mean, std) of the pooled per-curve values
+#              (for ParamSpecs whose dist == "normal"; low=loc, high=scale)
+# The dist type is taken from the class default_param_specs and preserved; only
+# the numbers are replaced. `pick` extracts the scalar this param wants out of
+# an estimator that returns a tuple/list.
+
+@dataclass
+class _Est:
+    stat:  str            # key into the per-curve stat cache
+    mode:  str            # "band" | "normal"
+    pick:  object = None  # index into a tuple stat, or None for scalar
+    floor: float  = None  # clamp low
+    ceil:  float  = None  # clamp high
+
+
+# stat producers: name -> (estimator_fn, "scalar"|"tuple"|"list")
+_STAT_PRODUCERS = {
+    "acf1":        (_est_acf1,             "scalar"),
+    "vol_units":   (_est_extreme_vol_units, "scalar"),
+    "tail_df":     (_est_tail_df,          "scalar"),
+    "vol_ratio":   (_est_vol_ratio,        "scalar"),
+    "drawdowns":   (_est_drawdowns,        "list"),    # list of (depth, dur)
+    "jumps":       (_est_jumps,            "tuple"),   # (lam,mu,sig,mdn,mup)
+    "drift":       (_est_drift_per_day,    "scalar"),
+}
+
+# (anomaly_type, param) -> _Est.  Anything absent stays at its class default.
+PARAM_ESTIMATORS: dict[tuple, _Est] = {
+    ("vol_spike",            "magnitude"):            _Est("vol_units", "band", floor=1.5),
+    ("persistent_vol_shift", "vol_multiplier"):       _Est("vol_ratio", "band", floor=0.2),
+    ("vol_cluster_burst",    "burst_vol_multiplier"): _Est("vol_ratio", "band", floor=1.0),
+    ("artificial_drawdown",  "depth"):                _Est("drawdowns", "band", pick=0, floor=0.01),
+    ("artificial_drawdown",  "drawdown_days"):        _Est("drawdowns", "band", pick=1, floor=WEEK_DAYS),
+    ("sync_drawdown_recovery","depth"):               _Est("drawdowns", "band", pick=0, floor=0.01),
+    ("drawdown_recovery_var","depth"):                _Est("drawdowns", "band", pick=0, floor=0.01),
+    ("heavy_tail_sub",       "tail_df"):              _Est("tail_df",   "band", floor=2.5, ceil=30.0),
+    ("ar1_injection",        "phi"):                  _Est("acf1",      "band"),
+    ("merton_jump",          "lam"):                  _Est("jumps",     "band", pick=0, floor=0.0),
+    ("merton_jump",          "sigma_j"):              _Est("jumps",     "band", pick=2, floor=1e-4),
+    ("merton_jump",          "mu_j"):                 _Est("jumps",     "normal", pick=1),
+    ("drift_injection",      "drift_per_day"):        _Est("drift",     "normal"),
+    ("regime_persistence",   "drift_amp"):            _Est("vol_units", "band", floor=0.02),
+    ("contagion",            "common_shock_vol"):     _Est("vol_units", "band", floor=0.5),
+}
+
+
+@dataclass
+class Calibration:
+    """Fitted bounds + the tf-bucket index map. `bands` is
+    density -> tf -> anomaly_type -> param -> (low, high).
+    `buckets` (tf -> [curve_idx]) and `tf_of` are rebuilt each run from
+    algo_meta; only `bands` is persisted."""
+    bands:    dict
+    buckets:  dict
+    tf_of:    list
+    run_id:   str
+
+    def bucket_of(self, curve_idx: int) -> str:
+        return self.tf_of[curve_idx] if 0 <= curve_idx < len(self.tf_of) else "_pooled"
+
+    def majority_tf(self, curves: list) -> str:
+        if not curves:
+            return "_pooled"
+        tfs = [self.bucket_of(c) for c in curves]
+        return max(set(tfs), key=tfs.count)
+
+    def spec_for(self, anomaly_type: str, tf: str, density: str) -> dict:
+        """Return a param_specs dict for this type: class defaults with the
+        calibrated params' bounds substituted. Falls back to the pooled bucket
+        for a tf that wasn't fit, and to the class default for any param the fit
+        skipped or couldn't estimate."""
+        base = {k: ParamSpec(**vars(v))
+                for k, v in ANOMALY_REGISTRY[anomaly_type]().default_param_specs.items()}
+        dens = self.bands.get(density, {})
+        fitted = dens.get(tf) or dens.get("_pooled") or {}
+        tvals  = fitted.get(anomaly_type, {})
+        for param, (lo, hi) in tvals.items():
+            if param in base and lo is not None and hi is not None:
+                base[param].low, base[param].high = lo, hi
+                base[param].value = None
+        return base
+
+
+def _pooled_scalars(stat_cache: dict, curve_idxs: list, stat: str,
+                    pick) -> np.ndarray:
+    """Collect the (optionally picked) scalar for `stat` across curves. For
+    'list' stats (drawdowns), flattens every episode's picked field."""
+    out = []
+    for c in curve_idxs:
+        v = stat_cache[c].get(stat)
+        if v is None:
+            continue
+        if isinstance(v, list):                    # drawdown episodes
+            out.extend(e[pick] for e in v if np.isfinite(e[pick]))
+        elif isinstance(v, tuple):
+            x = v[pick]
+            if x is not None and np.isfinite(x):
+                out.append(x)
+        else:
+            if np.isfinite(v):
+                out.append(v)
+    return np.asarray(out, float)
+
+
+def build_calibration(returns: np.ndarray, zero_mask: np.ndarray,
+                      tf_of: list, run_id: str) -> Calibration:
+    """Fit all bands for both densities from the real panel."""
+    N = returns.shape[1]
+
+    # buckets: tf -> [curve idx], only curves with enough active history
+    buckets: dict = {}
+    stat_cache: dict = {}
+    for c in range(N):
+        r = _active_returns(returns, zero_mask, c)
+        if r.size < CALIB_MIN_OBS_PER_CURVE:
+            continue
+        cache = {}
+        for name, (fn, _) in _STAT_PRODUCERS.items():
+            try:
+                cache[name] = fn(r)
+            except Exception:
+                cache[name] = None
+        stat_cache[c] = cache
+        buckets.setdefault(tf_of[c], []).append(c)
+
+    all_fit = [c for c in stat_cache]   # curves that cleared the obs gate
+
+    def fit_group(curve_idxs: list, pct_lo: float, pct_hi: float) -> dict:
+        types: dict = {}
+        for (atype, param), est in PARAM_ESTIMATORS.items():
+            vals = _pooled_scalars(stat_cache, curve_idxs, est.stat, est.pick)
+            if vals.size < 5:
+                continue
+            if est.mode == "band":
+                lo, hi = np.percentile(vals, [pct_lo, pct_hi])
+            else:  # normal -> (loc, scale)
+                lo, hi = float(vals.mean()), float(vals.std() + 1e-9)
+            if est.mode == "band":
+                if est.floor is not None:
+                    lo = max(lo, est.floor)
+                if est.ceil is not None:
+                    hi = min(hi, est.ceil)
+                if hi <= lo:
+                    hi = lo * 1.5 + 1e-9
+            types.setdefault(atype, {})[param] = (float(lo), float(hi))
+        return types
+
+    bands: dict = {}
+    for density, (plo, phi) in CALIB_PCT.items():
+        per_tf = {"_pooled": fit_group(all_fit, plo, phi)}
+        for tf, idxs in buckets.items():
+            group = idxs if len(idxs) >= CALIB_MIN_CURVES_PER_BUCKET else all_fit
+            if len(idxs) < CALIB_MIN_CURVES_PER_BUCKET:
+                print(f"    [calib] tf={tf}: {len(idxs)} curves "
+                      f"(< {CALIB_MIN_CURVES_PER_BUCKET}) — using pooled band")
+            per_tf[tf] = fit_group(group, plo, phi)
+        bands[density] = per_tf
+
+    return Calibration(bands=bands, buckets=buckets, tf_of=tf_of, run_id=run_id)
+
+
+# ── persistence ───────────────────────────────────────────────────────────────
+
+def _ensure_calibration_table(con) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS scenario_calibration (
+            run_id        VARCHAR,
+            density       VARCHAR,
+            tf            VARCHAR,
+            anomaly_type  VARCHAR,
+            param         VARCHAR,
+            low           DOUBLE,
+            high          DOUBLE,
+            calibrated_at TIMESTAMP
+        )
+    """)
+
+
+def persist_calibration(con, registry, calib: Calibration) -> None:
+    _ensure_calibration_table(con)
+    con.execute("DELETE FROM scenario_calibration WHERE run_id = ?", [calib.run_id])
+    now  = datetime.now(timezone.utc)
+    rows = []
+    for density, per_tf in calib.bands.items():
+        for tf, types in per_tf.items():
+            for atype, params in types.items():
+                for param, (lo, hi) in params.items():
+                    rows.append([calib.run_id, density, tf, atype, param,
+                                 lo, hi, now])
+    if rows:
+        df = pd.DataFrame(rows, columns=["run_id", "density", "tf",
+                                         "anomaly_type", "param", "low",
+                                         "high", "calibrated_at"])
+        registry.log_dataframe(calib.run_id, "scenario_calibration", df,
+                               if_exists="append")
+
+
+def load_calibration(con, data_run_id: str, tf_of: list,
+                     buckets: dict) -> Optional[Calibration]:
+    try:
+        df = con.execute(
+            "SELECT density, tf, anomaly_type, param, low, high "
+            "FROM scenario_calibration WHERE run_id = ?", [data_run_id]
+        ).df()
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    bands: dict = {}
+    for _, row in df.iterrows():
+        (bands.setdefault(row["density"], {})
+              .setdefault(row["tf"], {})
+              .setdefault(row["anomaly_type"], {}))[row["param"]] = (
+            float(row["low"]), float(row["high"]))
+    return Calibration(bands=bands, buckets=buckets, tf_of=tf_of,
+                       run_id=data_run_id)
+
+
+def resolve_or_build_calibration(con, registry, data_run_id: str,
+                                 returns: np.ndarray, zero_mask: np.ndarray,
+                                 tf_of: list, recalibrate: bool = False):
+    """Load the persisted fit for this run, or fit + persist if absent.
+    Returns a Calibration, or None if calibration is unavailable (caller then
+    runs on hand-set defaults)."""
+    buckets: dict = {}
+    for c in range(returns.shape[1]):
+        if _active_returns(returns, zero_mask, c).size >= CALIB_MIN_OBS_PER_CURVE:
+            buckets.setdefault(tf_of[c], []).append(c)
+
+    if not recalibrate:
+        cached = load_calibration(con, data_run_id, tf_of, buckets)
+        if cached is not None:
+            print("  Calibration      : loaded from scenario_calibration "
+                  f"(run {data_run_id[:8]})")
+            return cached
+
+    print("  Calibration      : fitting from panel"
+          f"{' (--recalibrate)' if recalibrate else ' (none on record)'}...",
+          flush=True)
+    calib = build_calibration(returns, zero_mask, tf_of, data_run_id)
+    persist_calibration(con, registry, calib)
+    print(f"  Calibration      : fit + persisted for run {data_run_id[:8]}")
+    return calib
+
+
+def validate_calibration(results: list, calib: Calibration) -> dict:
+    """Containment check: every calibrated parameter drawn for the realistic
+    bank must sit inside the empirical envelope (the wider adversarial p1–p99
+    band) for the bucket it was drawn against. A realistic draw landing outside
+    p1–p99 of the real panel means the fit or the sampling is wrong.
+
+    Returns {(type, param): (n_checked, n_in_envelope)} and prints a summary.
+    The per-type injected-vs-empirical *plot* belongs in run_stress_test.py,
+    where the plotting infrastructure lives; this is the numeric core.
+    """
+    adv = calib.bands.get("adversarial", {})
+    # Only band-mode params define a containment interval. normal-mode params
+    # store (loc, scale), which is not an interval — a Gaussian draw is not
+    # bounded by its own mean and sd — so they're excluded from this check.
+    band_params = {k for k, e in PARAM_ESTIMATORS.items() if e.mode == "band"}
+    tally: dict = {}
+    for res in results:
+        for rec in res.get("anomalies", []):
+            tf     = calib.majority_tf(rec.affected_curves)
+            fitted = (adv.get(tf) or adv.get("_pooled") or {}).get(rec.anomaly_type, {})
+            for param, (lo, hi) in fitted.items():
+                if param not in rec.params:
+                    continue
+                if (rec.anomaly_type, param) not in band_params:
+                    continue
+                val = rec.params[param]
+                if not isinstance(val, (int, float)):
+                    continue
+                n, ok = tally.get((rec.anomaly_type, param), (0, 0))
+                inside = (lo - 1e-9) <= val <= (hi + 1e-9)
+                tally[(rec.anomaly_type, param)] = (n + 1, ok + int(inside))
+
+    print("\n── Calibration validation (realistic draws vs empirical p1–p99) ──")
+    if not tally:
+        print("  (no calibrated parameters were drawn in this bank)")
+        return tally
+    all_ok = True
+    for (atype, param), (n, ok) in sorted(tally.items()):
+        flag = "OK " if ok == n else "!! "
+        all_ok &= (ok == n)
+        print(f"  {flag}{atype:24}{param:22} {ok}/{n} in envelope")
+    print(f"  {'PASS' if all_ok else 'FAIL'} — "
+          f"{'all realistic draws within empirical envelope' if all_ok else 'some draws escaped the envelope; review the fit'}")
+    return tally
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8.  CORRELATION DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1296,13 +1725,20 @@ class CorrelationDiscovery:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def select_curves(policy: dict, corr_info: dict, N: int,
-                  rng: np.random.Generator, params: dict = None) -> list:
+                  rng: np.random.Generator, params: dict = None,
+                  restrict_to: list = None) -> list:
     mode = policy["mode"]
 
     if mode == "random_subset":
+        # Bucket-coherent (a1): when restrict_to is given, sample the subset
+        # from within that single tf bucket so the drawn params (fit on that
+        # bucket) match the curves receiving them.
+        pool = restrict_to if restrict_to else list(range(N))
+        if not pool:
+            pool = list(range(N))
         n_min, n_max = policy["n_curves_range"]
-        n = int(rng.integers(n_min, min(n_max, N) + 1))
-        return list(rng.choice(N, size=n, replace=False).tolist())
+        n = int(rng.integers(n_min, min(n_max, len(pool)) + 1))
+        return list(rng.choice(pool, size=n, replace=False).tolist())
 
     if mode == "correlated_cluster":
         labels        = corr_info["cluster_labels"]
@@ -1350,19 +1786,32 @@ def select_curves(policy: dict, corr_info: dict, N: int,
 
 class ScenarioComposer:
     def __init__(self, returns_wide: pd.DataFrame, zero_mask: pd.DataFrame,
-                 corr_discovery: CorrelationDiscovery, seed: int):
+                 corr_discovery: CorrelationDiscovery, seed: int,
+                 calibration: "Calibration" = None):
         self.returns   = returns_wide.to_numpy().astype(np.float64)
         self.zero_mask = zero_mask.to_numpy().astype(bool)
         self.tickers   = returns_wide.columns.tolist()
         self.T, self.N = self.returns.shape
         self.corr_disc = corr_discovery
         self.base_seed = seed
+        self.calibration = calibration
         print("  Computing correlation structure...", flush=True)
         self.corr_info = corr_discovery.compute_full_sample()
         print(f"  n_clusters={self.corr_info['n_clusters']}  "
               f"silhouette={self.corr_info['silhouette_score']:.3f}", flush=True)
 
-    def compose_scenario(self, anomaly_specs: list, scenario_seed: int) -> dict:
+    def _choose_bucket(self, rng) -> str:
+        """Pick a tf bucket weighted by the number of calibratable curves in it."""
+        items = [(tf, len(idx)) for tf, idx in self.calibration.buckets.items() if idx]
+        if not items:
+            return "_pooled"
+        tfs, sizes = zip(*items)
+        p = np.asarray(sizes, float)
+        p = p / p.sum()
+        return tfs[int(rng.choice(len(tfs), p=p))]
+
+    def compose_scenario(self, anomaly_specs: list, scenario_seed: int,
+                         density: str = "realistic") -> dict:
         perturbed = self.returns.copy()
         rng       = np.random.default_rng(scenario_seed)
         records   = []
@@ -1376,12 +1825,47 @@ class ScenarioComposer:
         )
 
         for spec in anomaly_specs:
-            injector = ANOMALY_REGISTRY[spec["type"]]()
-            params   = spec["params"] if spec["params"] is not None \
-                       else ParameterSampler.sample(injector.param_specs, rng)
+            atype      = spec["type"]
+            injector   = ANOMALY_REGISTRY[atype]()
+            mode       = injector.targeting_policy["mode"]
+            used_specs = injector.param_specs
 
-            curves = select_curves(injector.targeting_policy, self.corr_info,
-                                   self.N, rng, params=params)
+            # Resolve (curves, params) with params drawn from the bucket-
+            # appropriate calibrated band. Ordering differs by targeting mode:
+            #   random_subset -> bucket chosen first, curves sampled within it
+            #   cluster/all   -> curves chosen on correlation, bucket = their
+            #                    majority tf (a1); a provisional draw supplies
+            #                    n_groups so targeting & injection stay consistent
+            if spec["params"] is not None:                      # explicit override
+                params = spec["params"]
+                curves = select_curves(injector.targeting_policy, self.corr_info,
+                                       self.N, rng, params=params)
+
+            elif self.calibration is None:                      # uncalibrated path
+                params = ParameterSampler.sample(injector.param_specs, rng)
+                curves = select_curves(injector.targeting_policy, self.corr_info,
+                                       self.N, rng, params=params)
+
+            elif mode == "random_subset":
+                tf         = self._choose_bucket(rng)
+                pool       = self.calibration.buckets.get(tf, [])
+                curves     = select_curves(injector.targeting_policy,
+                                           self.corr_info, self.N, rng,
+                                           restrict_to=pool)
+                used_specs = self.calibration.spec_for(atype, tf, density)
+                params     = ParameterSampler.sample(used_specs, rng)
+
+            else:                                               # cluster / all
+                prov   = ParameterSampler.sample(
+                            self.calibration.spec_for(atype, "_pooled", density), rng)
+                curves = select_curves(injector.targeting_policy, self.corr_info,
+                                       self.N, rng, params=prov)
+                tf         = self.calibration.majority_tf(curves)
+                used_specs = self.calibration.spec_for(atype, tf, density)
+                params     = ParameterSampler.sample(used_specs, rng)
+                if "n_groups" in prov:      # keep selection & injection consistent
+                    params["n_groups"] = prov["n_groups"]
+
             if not curves:
                 continue
 
@@ -1403,12 +1887,12 @@ class ScenarioComposer:
 
             records.append(AnomalyRecord(
                 anomaly_id      = str(uuid4()),
-                anomaly_type    = spec["type"],
+                anomaly_type    = atype,
                 layer           = injector.layer,
                 affected_curves = curves,
                 window          = window,
                 params          = _to_serialisable(params),
-                param_specs     = _serialise_param_specs(injector.param_specs),
+                param_specs     = _serialise_param_specs(used_specs),
             ))
 
         return {
@@ -1502,7 +1986,8 @@ class ScenarioSampler:
             if not spec:
                 continue
             seed   = int(self.rng.integers(0, 2**31))
-            result = composer.compose_scenario(spec, scenario_seed=seed)
+            result = composer.compose_scenario(spec, scenario_seed=seed,
+                                               density=self.density)
             result["_seed"]    = seed
             result["_density"] = self.density
             results.append(result)
@@ -1799,11 +2284,13 @@ class StressTestRunner:
 
 def main(
     data_run_id:       str   = None,
-    n_scenarios_core:  int   = 700,
-    n_scenarios_adv:   int   = 1200,
+    n_scenarios_core:  int   = 1200,
+    n_scenarios_adv:   int   = 700,
     rolling_window:    int   = 24 * WEEK_DAYS,
     seed:              int   = 42,
     enabled_types:     list  = None,
+    recalibrate:       bool  = False,
+    validate:          bool  = False,
 ) -> tuple:
     """
     Build the scenario bank and return (bank, composer, engine_run_id).
@@ -1828,11 +2315,11 @@ def main(
     if data_run_id is None:
         row = con.execute("""
             SELECT run_id FROM runs
-            WHERE json_extract_string(labels, '$.type') = 'data_pull'
+            WHERE json_extract_string(labels, '$.type') = 'algo_data_pull'
             ORDER BY created_at DESC LIMIT 1
         """).fetchone()
         if row is None:
-            raise RuntimeError("No data_pull run found in registry.")
+            raise RuntimeError("No algo_data_pull run found in registry.")
         data_run_id = row[0]
 
     print(f"\n── Scenario Engine ──────────────────────────────────────────────")
@@ -1842,29 +2329,43 @@ def main(
     print(f"  enabled_types   : {enabled_types or 'all'}")
 
     # ── Load returns ──────────────────────────────────────────────────────────
+    # Algo-only universe: fixed-notional arithmetic returns (ret = pnl / E_0),
+    # not log returns — see pull_algo_data.py for why log-return-on-equity
+    # doesn't apply to these accounts. CorrelationDiscovery/ScenarioComposer
+    # below operate on a generic (T x N) returns matrix and don't care which
+    # return convention produced it.
     print("\n  Loading returns...", flush=True)
-    mkt = con.execute(
-        "SELECT date, ticker, log_return FROM market_returns_sparse WHERE run_id = ?",
-        [data_run_id]
-    ).df()
-    mkt_wide = (mkt.pivot(index="date", columns="ticker", values="log_return")
-                   .sort_index())
-    mkt_wide.index = pd.to_datetime(mkt_wide.index)
-
     algo = con.execute(
-        "SELECT date, algo AS ticker, log_return FROM algo_returns WHERE run_id = ?",
+        'SELECT "Date" AS date, key AS ticker, ret FROM algo_returns_daily WHERE run_id = ?',
         [data_run_id]
     ).df()
-    algo_wide = (algo.pivot(index="date", columns="ticker", values="log_return")
-                    .sort_index())
-    algo_wide.index = pd.to_datetime(algo_wide.index)
+    returns_all = (algo.pivot(index="date", columns="ticker", values="ret")
+                       .sort_index())
+    returns_all.index = pd.to_datetime(returns_all.index)
 
-    returns_all = pd.concat([mkt_wide, algo_wide], axis=1).sort_index()
     zero_mask   = returns_all.isna() | (returns_all.abs() < 1e-12)
     returns_all = returns_all.fillna(0.0)
 
     print(f"  Shape           : {returns_all.shape}  "
           f"(T={returns_all.shape[0]}, N={returns_all.shape[1]})")
+
+    # ── Timeframe buckets + empirical calibration ─────────────────────────────
+    # tf_of[j] is the timeframe of the curve in column j, aligned to the panel
+    # column order (== composer.tickers). Calibration bands are keyed by tf.
+    meta = con.execute(
+        'SELECT key, tf FROM algo_meta WHERE run_id = ?', [data_run_id]
+    ).df()
+    tf_lookup = (dict(zip(meta["key"], meta["tf"]))
+                 if meta is not None and not meta.empty else {})
+    tf_of = [str(tf_lookup.get(k, "UNK")) for k in returns_all.columns]
+
+    calibration = resolve_or_build_calibration(
+        con, registry, data_run_id,
+        returns_all.to_numpy(dtype=float),
+        zero_mask.to_numpy(dtype=bool),
+        tf_of,
+        recalibrate=recalibrate,
+    )
 
     # ── Register engine run ───────────────────────────────────────────────────
     engine_run_id = registry.start_run(
@@ -1878,7 +2379,8 @@ def main(
 
     # ── Build composer ──────────────────────────────────────────────────────
     corr_disc = CorrelationDiscovery(returns_all, rolling_window, seed)
-    composer  = ScenarioComposer(returns_all, zero_mask, corr_disc, seed)
+    composer  = ScenarioComposer(returns_all, zero_mask, corr_disc, seed,
+                                 calibration=calibration)
     bank      = ScenarioBank(registry, data_run_id)
 
     # ── Core bank ────────────────────────────────────────────────────────────
@@ -1893,6 +2395,10 @@ def main(
     sampler_adv = ScenarioSampler(density="adversarial", seed=seed + 1,
                                    enabled_types=enabled_types)
     adv = sampler_adv.generate_bank(n_scenarios_adv, composer)
+
+    # ── Validate ───────────────────────────────────────────────────────────────
+    if validate and calibration is not None:
+        validate_calibration(core, calibration)
 
     # ── Store ────────────────────────────────────────────────────────────────
     print("\n  Storing scenarios...", flush=True)
@@ -1930,10 +2436,20 @@ if __name__ == "__main__":
         description="Scenario injection engine for portfolio stress testing"
     )
     parser.add_argument("--data-run-id",       type=str, default=None)
-    parser.add_argument("--n-scenarios-core",  type=int, default=700)
-    parser.add_argument("--n-scenarios-adv",   type=int, default=1200)
+    parser.add_argument("--n-scenarios-core",  type=int, default=1200)
+    parser.add_argument("--n-scenarios-adv",   type=int, default=700)
     parser.add_argument("--rolling-window",    type=int, default=24 * WEEK_DAYS)
     parser.add_argument("--seed",              type=int, default=42)
+    parser.add_argument(
+        "--recalibrate", action="store_true",
+        help="Force a refit of the empirical calibration even if one is already "
+             "persisted for this data run (otherwise the stored fit is reused).",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="After building the bank, check that every realistic draw lands "
+             "inside the empirical p1–p99 envelope, and print a per-type report.",
+    )
     parser.add_argument(
         "--enabled-types", type=str, nargs="*", default=None,
         metavar="TYPE",
@@ -1952,4 +2468,6 @@ if __name__ == "__main__":
         rolling_window   = args.rolling_window,
         seed             = args.seed,
         enabled_types    = args.enabled_types,
+        recalibrate      = args.recalibrate,
+        validate         = args.validate,
     )

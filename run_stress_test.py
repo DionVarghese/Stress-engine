@@ -21,6 +21,7 @@ python scripts/run_stress_test.py
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -36,7 +37,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from quant.utils.db import RunRegistry, get_connection
-from scenario_engine import ANOMALY_REGISTRY, LAYER_ORDER
+from scenario_engine import (
+    ANOMALY_REGISTRY, LAYER_ORDER,
+    PARAM_ESTIMATORS, _STAT_PRODUCERS, _pooled_scalars, _active_returns,
+    CALIB_MIN_OBS_PER_CURVE,
+)
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -100,23 +105,21 @@ def _get_data_run_id(con, engine_run_id: str) -> str:
 
 
 def _load_returns(con, data_run_id: str) -> pd.DataFrame:
-    mkt = con.execute(
-        "SELECT date, ticker, log_return FROM market_returns_sparse WHERE run_id = ?",
-        [data_run_id]
-    ).df()
-    mkt_wide = (mkt.pivot(index="date", columns="ticker", values="log_return")
-                   .sort_index())
-    mkt_wide.index = pd.to_datetime(mkt_wide.index)
-
+    # Algo-only universe with fixed-notional arithmetic returns (`ret`), loaded
+    # exactly as scenario_engine.main() does — same table, same pivot — so the
+    # column order (and therefore the curve_idx↔ticker mapping stored in
+    # scenario_snapshots / scenario_deltas) is identical here and at inject time.
+    # The engine dropped market_returns_sparse / algo_returns(log_return) when it
+    # moved to algo-only data; reconstructing on those tables would mismatch both
+    # the universe AND the return convention the stored deltas were computed in.
     algo = con.execute(
-        "SELECT date, algo AS ticker, log_return FROM algo_returns WHERE run_id = ?",
+        'SELECT "Date" AS date, key AS ticker, ret FROM algo_returns_daily WHERE run_id = ?',
         [data_run_id]
     ).df()
-    algo_wide = (algo.pivot(index="date", columns="ticker", values="log_return")
-                    .sort_index())
-    algo_wide.index = pd.to_datetime(algo_wide.index)
-
-    return pd.concat([mkt_wide, algo_wide], axis=1).sort_index().fillna(0.0)
+    wide = (algo.pivot(index="date", columns="ticker", values="ret")
+                .sort_index())
+    wide.index = pd.to_datetime(wide.index)
+    return wide.fillna(0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -237,7 +240,11 @@ def _reconstruct(returns_np, delta, col_idx, start, end):
 
 
 def _equity_curves(orig, pert):
-    return np.cumprod(1 + orig), np.cumprod(1 + pert)
+    # Fixed-notional arithmetic equity (1 + cumulative sum), NOT cumprod. The
+    # algo pipeline is built on fixed-notional arithmetic returns, and the
+    # engine's own drawdown estimator uses cumsum for exactly this reason —
+    # compounding would misstate depth/vol relative to how the bank was fit.
+    return 1.0 + np.cumsum(orig), 1.0 + np.cumsum(pert)
 
 
 def _rolling_corr(a: np.ndarray, b: np.ndarray, window: int = 15) -> np.ndarray:
@@ -373,7 +380,7 @@ def _draw_daily_returns(ax, con, returns_np, ticker_idx, T,
     ax.axhline(0.0, color="grey", lw=0.5)
     _shade_window(ax, meta["window_start"], meta["window_end"], p0, colour)
     ax.set_xlabel("trading days", fontsize=6)
-    ax.set_ylabel("daily log-return", fontsize=6)
+    ax.set_ylabel("daily return", fontsize=6)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -397,7 +404,7 @@ def plot_anomaly_diagnostics(con, returns: pd.DataFrame, out_path: str,
     fig.subplots_adjust(hspace=0.60, wspace=0.38)
     fig.suptitle(
         "Scenario Engine — Original vs Perturbed\n"
-        "(equity curve | rolling correlation | daily returns  —  per anomaly type)",
+        "(equity curve | rolling correlation  —  per anomaly type)",
         fontsize=11, fontweight="bold", y=0.99,
     )
 
@@ -566,6 +573,145 @@ def plot_single_anomaly_type(con, returns: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CALIBRATION ENVELOPE DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _empirical_stat_cache(returns_np: np.ndarray, zero_mask: np.ndarray) -> dict:
+    """Per-curve statistic cache, mirroring build_calibration's inner loop, so
+    the empirical distributions plotted here are exactly the ones the engine fit
+    its bands against (same estimators, same min-obs gate)."""
+    cache = {}
+    for c in range(returns_np.shape[1]):
+        r = _active_returns(returns_np, zero_mask, c)
+        if r.size < CALIB_MIN_OBS_PER_CURVE:
+            continue
+        stats_c = {}
+        for name, (fn, _) in _STAT_PRODUCERS.items():
+            try:
+                stats_c[name] = fn(r)
+            except Exception:
+                stats_c[name] = None
+        cache[c] = stats_c
+    return cache
+
+
+def _injected_draws(con, engine_run_id: str) -> dict:
+    """(anomaly_type, param) -> np.array of numeric values actually drawn into
+    this run's bank, parsed from the stored anomaly_instances.params JSON."""
+    df = con.execute("""
+        SELECT ai.anomaly_type, ai.params
+        FROM anomaly_instances ai
+        JOIN scenarios         s ON s.scenario_id = ai.scenario_id
+        WHERE s.engine_run_id = ?
+    """, [engine_run_id]).df()
+    out: dict = {}
+    for _, row in df.iterrows():
+        atype  = row["anomaly_type"]
+        raw    = row["params"]
+        try:
+            params = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(params, dict):
+            continue
+        for p, v in params.items():
+            # skip bools (choice flags) and non-numerics
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            out.setdefault((atype, p), []).append(float(v))
+    return {k: np.asarray(v, float) for k, v in out.items()}
+
+
+def plot_calibration_diagnostics(con, returns: pd.DataFrame, out_path: str,
+                                 engine_run_id: str, data_run_id: str):
+    """
+    Per-(type, param) injected-vs-empirical view that the engine's
+    validate_calibration docstring defers to run_stress_test. For every
+    band-mode calibrated parameter it overlays, in the statistic's native units:
+      • empirical  — the per-curve statistic distribution from the real panel (grey)
+      • injected   — the values actually drawn into this bank (red)
+      • envelope   — the fitted adversarial p1–p99 band [low, high] (shaded)
+    A draw landing outside the shaded band is a fit-or-sampling problem: this is
+    the visual counterpart of validate_calibration's numeric containment check.
+    """
+    # Widest (adversarial) band, pooled tf — the fallback order
+    # validate_calibration itself uses (adv.get(tf) or adv.get("_pooled")).
+    bands = con.execute("""
+        SELECT anomaly_type, param, low, high
+        FROM scenario_calibration
+        WHERE run_id = ? AND density = 'adversarial' AND tf = '_pooled'
+    """, [data_run_id]).df()
+    if bands is None or bands.empty:
+        print("  No calibration on record for this data run — skipping "
+              "calibration envelope plot.")
+        return
+
+    band_params = {k for k, e in PARAM_ESTIMATORS.items() if e.mode == "band"}
+    band_lookup = {(r["anomaly_type"], r["param"]): (float(r["low"]), float(r["high"]))
+                   for _, r in bands.iterrows()
+                   if (r["anomaly_type"], r["param"]) in band_params}
+    if not band_lookup:
+        print("  No band-mode calibrated params to plot — skipping.")
+        return
+
+    returns_np = returns.to_numpy().astype(np.float64)
+    zero_mask  = np.abs(returns_np) < 1e-12
+    stat_cache = _empirical_stat_cache(returns_np, zero_mask)
+    all_curves = list(stat_cache)
+    injected   = _injected_draws(con, engine_run_id)
+
+    entries = sorted(band_lookup)
+    n       = len(entries)
+    ncol    = 3
+    nrow    = (n + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6 * ncol, 3.6 * nrow))
+    axes = np.atleast_1d(axes).ravel()
+    fig.suptitle(
+        "Calibration envelope — injected draws vs empirical panel "
+        "(shaded = adversarial p1–p99)",
+        fontsize=12, fontweight="bold", y=0.997,
+    )
+
+    for ax, (atype, param) in zip(axes, entries):
+        lo, hi = band_lookup[(atype, param)]
+        est    = PARAM_ESTIMATORS[(atype, param)]
+        emp    = _pooled_scalars(stat_cache, all_curves, est.stat, est.pick)
+        draws  = injected.get((atype, param), np.asarray([], float))
+
+        layer  = ANOMALY_REGISTRY[atype].layer
+        colour = LAYER_COLOURS.get(layer, "#999999")
+
+        if emp.size:
+            ax.hist(emp, bins=40, density=True, color="#9E9E9E", alpha=0.55,
+                    label=f"empirical (n={emp.size})")
+        if draws.size:
+            ax.hist(draws, bins=30, density=True, color="#C62828", alpha=0.55,
+                    label=f"injected (n={draws.size})")
+        ax.axvspan(lo, hi, color=colour, alpha=0.15, lw=0)
+        ax.axvline(lo, color=colour, lw=0.8, ls=":")
+        ax.axvline(hi, color=colour, lw=0.8, ls=":")
+
+        inside = (int(np.sum((draws >= lo - 1e-9) & (draws <= hi + 1e-9)))
+                  if draws.size else 0)
+        pct    = f"{100 * inside / draws.size:.0f}%" if draws.size else "n/a"
+        ax.set_title(f"{atype}.{param}\n{inside}/{draws.size} in band ({pct})",
+                     fontsize=8, color=colour, fontweight="bold")
+        ax.tick_params(labelsize=7)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(fontsize=6, frameon=False)
+
+    for ax in axes[n:]:
+        ax.axis("off")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {out_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODEL_FN WRAPPERS  (stubs — implement for Phase 2)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -610,6 +756,11 @@ def main(engine_run_id: str = None, out_dir: str = "plots/stress_test",
         out_path = os.path.join(out_dir, "00_anomaly_overview.png")
         print(f"\n  Plotting {PLOT_GRID_ROWS}x{PLOT_GRID_COLS} overview...")
         plot_anomaly_diagnostics(con, returns, out_path, engine_run_id)
+
+        cal_path = os.path.join(out_dir, "01_calibration_envelope.png")
+        print(f"\n  Plotting calibration envelope...")
+        plot_calibration_diagnostics(con, returns, cal_path,
+                                     engine_run_id, data_run_id)
 
     if run_model:
         print("\n  Phase 2 — implement make_nco_dwf_fn() first.")
